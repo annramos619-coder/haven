@@ -4064,7 +4064,7 @@ def listing_revenue():
         "ok": True,
         "property": prop.name,
         "listing_id": lid,
-        "reservations": rows[:50],
+        "reservations": rows,
         "monthly": monthly_rows,
         "ytd_revenue": round(ytd_revenue, 2),
         "ytd_nights": ytd_nights,
