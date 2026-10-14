@@ -995,23 +995,23 @@ async function loadActionQueue(generate = false) {
   const res = await fetch(url);
   const data = await res.json();
   const actions = (data.actions || []).filter(a => ["pending", "approved"].includes(a.status || "pending"));
-  const recoveryActions = actions.filter(a => !(a.type || "").includes("fast_booking")).slice(0, 8);
-  const fastActions = actions.filter(a => (a.type || "").includes("fast_booking")).slice(0, 8);
+  const recoveryActions = actions.filter(a => !(a.type || "").includes("fast_booking"));
+  const fastActions = actions.filter(a => (a.type || "").includes("fast_booking"));
 
   el.innerHTML = `
     <section class="kd-card p-5">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 class="text-lg font-bold text-slate-900">Weekly Review Queue</h2>
-          <p class="text-sm text-slate-500 mt-1">Approve tasks first. Apply approved price actions in PriceLabs, then mark them applied here.</p>
+          <h2 class="text-lg font-bold text-slate-900">Weekly Review Queue · Pulse</h2>
+          <p class="text-sm text-slate-500 mt-1">Daily review · Next 120 days · Increases only. Studios–2BR: $1–$5; 3BR+: $5–$10; fixed minimum: $1–$3. Base and minimum prices stay unchanged.</p>
         </div>
-        <button onclick="loadActionQueue(true)" class="text-xs px-3 py-1.5 rounded bg-blue-600 text-white font-semibold">Generate Weekly Suggestions</button>
+        <button onclick="loadActionQueue(true)" class="text-xs px-3 py-1.5 rounded bg-blue-600 text-white font-semibold">Refresh Pulse Suggestions</button>
       </div>
       <div class="mt-4 space-y-2">
         ${actions.length ? `
-          ${recoveryActions.length ? `<div class="text-xs font-bold uppercase tracking-wide text-slate-400 pt-1">Needs Demand / Pickup</div>${recoveryActions.map(actionCard).join("")}` : ""}
+          ${recoveryActions.length ? `<div class="text-xs font-bold uppercase tracking-wide text-slate-400 pt-1">Nightly nudges for review</div>${recoveryActions.map(actionCard).join("")}` : ""}
           ${fastActions.length ? `<div class="text-xs font-bold uppercase tracking-wide text-slate-400 pt-4">Fast Booking / Possible Underpricing</div>${fastActions.map(actionCard).join("")}` : ""}
-        ` : `<div class="text-sm text-slate-400 py-4">No pending actions yet. Generate weekly suggestions when ready.</div>`}
+        ` : `<div class="text-sm text-slate-400 py-4">No current Pulse suggestions. Refresh suggestions using the latest dated nightly rates and reservation data.</div>`}
       </div>
     </section>`;
   attachActionButtons();
@@ -1632,6 +1632,10 @@ function actionCard(action) {
             </div>
           </div>
         ` : ""}
+        ${action.daily_nudges?.length ? `<details class="mt-3"><summary class="cursor-pointer text-sm font-semibold text-blue-700">Review ${action.daily_nudges.length} nightly suggestions</summary>
+          <div class="overflow-x-auto max-h-96 mt-2"><table class="w-full text-xs text-left"><thead><tr><th>Date</th><th>Current</th><th>Nudge</th><th>Suggested</th><th>Signal / reason</th></tr></thead><tbody>
+          ${action.daily_nudges.map(n => `<tr class="border-t border-slate-100"><td class="py-2 pr-3 whitespace-nowrap">${escapeHtml(n.date)}<br>${escapeHtml(n.day)}</td><td class="pr-3">$${Number(n.current_rate).toFixed(2)}</td><td class="pr-3 text-green-700">+$${Number(n.nudge).toFixed(0)}</td><td class="pr-3 font-semibold">$${Number(n.proposed_rate).toFixed(2)}</td><td class="py-2">${escapeHtml(n.demand)}<br>${escapeHtml(n.reason)}</td></tr>`).join("")}
+          </tbody></table></div></details>` : ""}
         ${priceCheckHtml}
         <div class="text-xs text-slate-500 mt-1">${escapeHtml(action.reason || "")}</div>
         ${action.owner_note ? `<div class="text-xs font-semibold text-purple-700 bg-purple-50 border border-purple-100 rounded px-2 py-1 mt-2">Owner note: ${escapeHtml(action.owner_note)}</div>` : ""}
