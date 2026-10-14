@@ -1167,6 +1167,7 @@ def _action_dedupe_key(action: dict) -> tuple:
         payload.get("suggested_base_price"),
         payload.get("estimated_base_price"),
         payload.get("estimated_rate"),
+        tuple((n["date"], n["current_rate"], n["proposed_rate"]) for n in action.get("daily_nudges", [])),
     )
 
 
@@ -1194,231 +1195,29 @@ def _recently_reviewed(action: dict, now: datetime) -> bool:
     return now - reviewed <= timedelta(days=ACTION_REPEAT_COOLDOWN_DAYS)
 
 
-def _suggest_action(prop: Property) -> dict | None:
-    """4-criteria scorecard for base rate decisions, occupancy window by bedroom count.
+def _suggest_action(prop: Property, reservations=None) -> dict | None:
+    from pulse_nudges import build_nudges
+    result = build_nudges(prop, reservations)
+    nudges = result["daily_nudges"]
+    return {
+        **_action_context(prop), **result,
+        "type": "pulse_daily_nudge", "priority": "medium",
+        "suggestion": f"Pulse: {len(nudges)} nightly increase suggestions" if nudges else "Pulse: data review needed",
+        "adjustment": f"{result['band']} per night; increases only",
+        "target_dates": f"{date.today() + timedelta(days=1)} through {date.today() + timedelta(days=120)}",
+        "current_value": "Date-specific nightly rates" if result["has_rates"] else "No dated nightly rates loaded",
+        "proposed_value": "Review each night below; hold base and minimum prices" if nudges else "Hold rates; sync dated rates and verify open nights",
+        "owner_note": _owner_note(prop),
+        "reason": "Friday/Saturday and listing occupancy select the nudge within your band. "
+                  "Weekdays also increase under the current policy. No automatic reductions. "
+                  "Unreserved dates are candidates, not confirmed gaps; owner blocks must be checked. "
+                  f"{result['ceiling_holds']} nights held at the maximum-price limit.",
+        "implementation": "Review daily against fresh prices and confirmed availability. Apply each absolute target at most once; "
+                          "do not add the nudge repeatedly to an old rate. Monitor pickup and occupancy over the next 7 days. "
+                          "A rate edit does not guarantee better search placement or bookings.",
+        "pricelabs_payload": {"kind": "manual_review"},
+    }
 
-    Occupancy window (booking windows differ by size):
-      1-2BR → next 45 days (est. from 30d/60d)
-      3-4BR → next 90 days
-      5BR+  → next 120 days
-
-    Red flags (each is a decrease signal):
-    1. Occ below 40% in the window for this BR count
-    2. Fewer than 3 reservations in the last 30 days
-    3. Last booked more than 14 days ago
-    4. 10+ points below the same-group average occupancy (same window)
-
-    0 red flags → increase base | 1 → small increase | 2 → hold & monitor | 3-4 → decrease
-    Override: occ ≥ 85% always increase; occ < 10% always decrease.
-    """
-    benchmark = _benchmark_for(prop)
-    occ_gap = benchmark.get("occ_gap", 0)
-    owner_note = _owner_note(prop)
-    stagnant = _stagnant_rate_window(prop)
-
-    # ── Bedroom-based occupancy window ───────────────────────────────────────
-    beds = int(prop.bedrooms or 0)
-    def _window_occ(p) -> float:
-        if beds <= 2:
-            # Real 45d occupancy from PriceLabs API when synced; else estimate
-            if p.adj_occ_45d > 0:
-                return p.adj_occ_45d
-            if p.adj_occ_30d > 0 and p.adj_occ_60d > 0:
-                return (p.adj_occ_30d + p.adj_occ_60d) / 2
-            return p.adj_occ_60d
-        if beds <= 4:
-            # Fall back to 60d (always populated) if 90d is missing from this
-            # week's export — matches the fallback pattern used by the other
-            # two bands instead of silently reading as 0% occupancy.
-            return p.adj_occ_90d if p.adj_occ_90d > 0 else p.adj_occ_60d
-        if p.adj_occ_120d > 0:
-            return p.adj_occ_120d
-        return p.adj_occ_90d if p.adj_occ_90d > 0 else p.adj_occ_60d
-
-    window_label = "45d" if beds <= 2 else ("90d" if beds <= 4 else "120d")
-    occ = _window_occ(prop)
-
-    # Same customization-group average over the SAME window
-    group_peers = [
-        p for p in _PORTFOLIO
-        if p.active and p.name != prop.name
-        and (p.customization_group or "") == (prop.customization_group or "")
-        and int(p.bedrooms or 0) == beds
-        and p.urgency != "onboarding"
-    ]
-    if len(group_peers) < 3:  # widen to whole group if BR slice too thin
-        group_peers = [
-            p for p in _PORTFOLIO
-            if p.active and p.name != prop.name
-            and (p.customization_group or "") == (prop.customization_group or "")
-            and p.urgency != "onboarding"
-        ]
-    group_occ = (sum(_window_occ(p) for p in group_peers) / len(group_peers)) if group_peers else benchmark.get("occ_90d", 50) / 100
-    group_gap_pts = (occ - group_occ) * 100  # negative = below group
-
-    # ── 4 criteria (green = healthy; red flag = inverse) ─────────────────────
-    # Pickup: prefer 30d reservation count (Report Builder CSV); else use
-    # PriceLabs API unique reservations past 15d doubled as a 30d estimate
-    resv_30d = prop.reservations_30d if prop.reservations_30d > 0 else prop.reservations_15d * 2
-    c1_above_group  = group_gap_pts > -10                                   # not 10+ pts below group avg
-    c2_good_pickup  = resv_30d >= 3                                         # ≥3 reservations last 30d
-    c3_above_min    = occ >= 0.40                                           # ≥40% occ in BR window
-    c4_recent_book  = (prop.last_booked_days is not None and prop.last_booked_days <= 14)
-
-    score = sum([c1_above_group, c2_good_pickup, c3_above_min, c4_recent_book])
-
-    def _criteria_note() -> str:
-        flags = [
-            (f"Within 10pts of group ({window_label})", c1_above_group, f"{occ:.0%} vs {group_occ:.0%} avg ({group_gap_pts:+.1f} pts, {len(group_peers)} peers)"),
-            ("Pickup ≥3 resv/30d", c2_good_pickup, f"{resv_30d} reservations" + ("" if prop.reservations_30d > 0 else " (est. from 15d API count)")),
-            (f"Occ ≥40% next {window_label}", c3_above_min, f"{occ:.0%}"),
-            ("Booked last 14d", c4_recent_book, f"{prop.last_booked_days}d ago" if prop.last_booked_days is not None else "no record"),
-        ]
-        parts = [f"{'✓' if ok else '✗'} {label}: {detail}" for label, ok, detail in flags]
-        return f"Score {score}/4 ({beds}BR → {window_label} window) — " + " · ".join(parts)
-
-    # ── Override: hard floor / ceiling ──────────────────────────────────────
-    if occ >= 0.85 or (c1_above_group and c2_good_pickup and occ >= 0.70):
-        pct = 0.05
-        new_base = _pct_rate(prop.base_price, pct)
-        return {
-            **_action_context(prop),
-            "type": "fast_booking_price_increase",
-            "priority": "high",
-            "suggestion": f"Increase base price {_pct_label(pct)} — strong demand signal",
-            "adjustment": f"{_pct_label(pct)} base increase",
-            "target_dates": "Next 60 days",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}",
-            "proposed_value": f"Base {_pct_label(pct)} (est. {_money(new_base)})",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Approve then update PriceLabs base price. Do not change max price.",
-            "pricelabs_payload": {"kind": "base_percentage_review", "adjustment_pct": pct, "estimated_base_price": new_base},
-        }
-
-    if occ < 0.10 and prop.last_booked_days is not None and prop.last_booked_days > 30:
-        pct = -0.10
-        new_base, hit_floor = _floor_limited_rate(prop, pct)
-        return {
-            **_action_context(prop),
-            "type": "low_occupancy_base_adjustment",
-            "priority": "high",
-            "suggestion": f"Decrease base {_pct_label(pct)} — very low occ + stale bookings",
-            "adjustment": f"{_pct_label(pct)} base decrease",
-            "target_dates": "Until next weekly review",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}",
-            "proposed_value": f"Base est. {_money(new_base)}",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Approve then reduce base in PriceLabs. Recheck in 7 days.",
-            "pricelabs_payload": {"kind": "base_price_review" if hit_floor else "base_percentage_review", "adjustment_pct": pct, "suggested_base_price": new_base if hit_floor else None, "estimated_base_price": new_base},
-        }
-
-    # ── Score-based decisions ────────────────────────────────────────────────
-    if score == 4:
-        pct = 0.05
-        new_base = _pct_rate(prop.base_price, pct)
-        return {
-            **_action_context(prop),
-            "type": "scorecard_increase_strong",
-            "priority": "high",
-            "suggestion": f"Increase base price {_pct_label(pct)} — all 4 signals green",
-            "adjustment": f"{_pct_label(pct)} base increase",
-            "target_dates": "Next 60 days",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}; {prop.reservations_30d} resv/30d",
-            "proposed_value": f"Base {_pct_label(pct)} (est. {_money(new_base)})",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Approve then update PriceLabs base price. Do not change max price.",
-            "pricelabs_payload": {"kind": "base_percentage_review", "adjustment_pct": pct, "estimated_base_price": new_base},
-        }
-
-    if score == 3:
-        pct = 0.03
-        new_base = _pct_rate(prop.base_price, pct)
-        return {
-            **_action_context(prop),
-            "type": "scorecard_increase_moderate",
-            "priority": "medium",
-            "suggestion": f"Consider small base increase {_pct_label(pct)} — 3/4 signals green",
-            "adjustment": f"{_pct_label(pct)} base review",
-            "target_dates": "Next 60 days",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}; {prop.reservations_30d} resv/30d",
-            "proposed_value": f"Base {_pct_label(pct)} (est. {_money(new_base)})",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Approve to nudge base up. Monitor pickup for 7 days before further increases.",
-            "pricelabs_payload": {"kind": "base_percentage_review", "adjustment_pct": pct, "estimated_base_price": new_base},
-        }
-
-    if score == 2:
-        # Check for stagnant calendar dates as a targeted action
-        if stagnant and not c3_above_min:
-            pct = stagnant["adjustment_pct"]
-            hit_floor = stagnant["hit_floor"]
-            return {
-                **_action_context(prop),
-                "type": "stagnant_rate_nudge",
-                "priority": "medium",
-                "suggestion": f"Hold base; targeted adjustment for stagnant dates {stagnant['label']}",
-                "adjustment": f"{_pct_label(pct)} date adjustment",
-                "target_dates": stagnant["label"],
-                "current_value": f"{stagnant['nights']} nights at {_money(stagnant['rate'])}",
-                "proposed_value": f"Minimum floor {_money(stagnant['suggested_rate'])}" if hit_floor else f"Date adjustment {_pct_label(pct)} (est. {_money(stagnant['suggested_rate'])})",
-                "owner_note": owner_note,
-                "reason": _criteria_note(),
-                "implementation": "Do not change base price. Apply a narrow date-level adjustment only for the stagnant window.",
-                "pricelabs_payload": {
-                    "kind": "custom_fixed_rate" if hit_floor else "custom_percentage_adjustment",
-                    "start_date": stagnant["start"].isoformat(),
-                    "end_date": stagnant["end"].isoformat(),
-                    "adjustment_pct": pct,
-                    "suggested_rate": stagnant["suggested_rate"] if hit_floor else None,
-                    "estimated_rate": stagnant["suggested_rate"],
-                },
-            }
-        return {
-            **_action_context(prop),
-            "type": "hold_rate_monitor_pickup",
-            "priority": "medium",
-            "suggestion": "Hold base price — mixed signals, monitor pickup",
-            "adjustment": "No price change",
-            "target_dates": "Until next weekly review",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}; {prop.reservations_30d} resv/30d",
-            "proposed_value": "Hold base; reassess next week",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Do not push pricing this week. Check which 2 signals are red and address the root cause.",
-            "pricelabs_payload": {"kind": "manual_review"},
-        }
-
-    # score 0 or 1 → decrease
-    if score <= 1:
-        if prop.no_promotions:
-            pct = -0.03
-        elif not c3_above_min and not c2_good_pickup:
-            pct = -0.07  # both minimum occ AND pickup failing
-        else:
-            pct = -0.05
-        new_base, hit_floor = _floor_limited_rate(prop, pct)
-        return {
-            **_action_context(prop),
-            "type": "scorecard_decrease",
-            "priority": "high" if score == 0 else "medium",
-            "suggestion": (
-                f"Decrease base {_pct_label(pct)} — {score}/4 signals green"
-            ),
-            "adjustment": f"floor-limited to {_money(new_base)}" if hit_floor else f"{_pct_label(pct)} base decrease",
-            "target_dates": "Until next weekly review",
-            "current_value": f"Base {_money(prop.base_price)}; {window_label} occ {occ:.0%}; {prop.reservations_30d} resv/30d; last booked {prop.last_booked_days}d ago",
-            "proposed_value": f"Base est. {_money(new_base)}",
-            "owner_note": owner_note,
-            "reason": _criteria_note(),
-            "implementation": "Approve then reduce base in PriceLabs. Recheck pickup and reservations in 7 days.",
-            "pricelabs_payload": {"kind": "base_price_review" if hit_floor else "base_percentage_review", "adjustment_pct": pct, "suggested_base_price": new_base if hit_floor else None, "estimated_base_price": new_base},
-        }
-
-    return None
 
 
 def _generate_weekly_actions() -> list[dict]:
@@ -1428,6 +1227,9 @@ def _generate_weekly_actions() -> list[dict]:
     protected: list[dict] = []
     protected_keys = set()
     for action in existing:
+        if action.get("policy") == "pulse-increase-only-v1" and action.get("status") == "approved":
+            # Regeneration invalidates approvals based on older rate snapshots.
+            continue
         if _is_pace_year_action(action):
             continue
         status = action.get("status", "pending")
@@ -1439,23 +1241,23 @@ def _generate_weekly_actions() -> list[dict]:
             protected.append(action)
             protected_keys.add(key)
 
-    from kcity_surge_dso import _is_kcity
-
     created_by_key: dict[tuple, dict] = {}
-    # KCity/Knoxville listings are handled through the dedicated KCity Surge
-    # DSOs page (event-based date-specific overrides), not the general base-
-    # rate scorecard — exclude them here so they don't show up twice.
-    underperforming = [
-        p for p in _PORTFOLIO
-        if p.active and p.urgency in {"critical", "warning"} and not p.onboarding and not _is_kcity(p)
-    ][:80]
-    overperforming = [
-        p for p in _PORTFOLIO
-        if p.active and p.urgency == "overperforming" and not _is_kcity(p)
-    ][:60]
-    candidates = underperforming + overperforming
+    candidates = [p for p in _PORTFOLIO if p.active and not p.onboarding]
+    reservations_by_listing = {}
+    reservations_loaded = False
+    if any(p.calendar_rates for p in candidates):
+        try:
+            from pricelabs_reservations import fetch_raw, to_hostaway_shape
+            raw = fetch_raw(stay_start=(date.today() - timedelta(days=365)).isoformat(),
+                            stay_end=(date.today() + timedelta(days=121)).isoformat())
+            for row in raw:
+                reservations_by_listing.setdefault(str(row.get("listing_id") or ""), []).append(to_hostaway_shape(row))
+            reservations_loaded = True
+        except Exception as exc:
+            app.logger.warning("Pulse reservation lookup failed: %s", exc)
     for prop in candidates:
-        action = _suggest_action(prop)
+        reservations = reservations_by_listing.get(str(prop.listing_id), []) if reservations_loaded else None
+        action = _suggest_action(prop, reservations)
         if not action:
             continue
         key = _action_dedupe_key(action)
@@ -2238,6 +2040,12 @@ If a setting says "unknown", do not infer or invent it. Treat PriceLabs as the p
 def _apply_weekly_action(action: dict) -> dict:
     payload = action.get("pricelabs_payload") or {}
     kind = payload.get("kind")
+    if action.get("type") in {
+        "fast_booking_price_increase", "low_occupancy_base_adjustment",
+        "scorecard_increase_strong", "scorecard_increase_moderate",
+        "stagnant_rate_nudge", "hold_rate_monitor_pickup", "scorecard_decrease",
+    }:
+        raise PricingApplyError("This weekly suggestion predates the increase-only Pulse policy. Regenerate Pulse suggestions.")
     if not kind:
         raise PricingApplyError("This action has no PriceLabs payload. Regenerate weekly suggestions.")
     if kind == "manual_review":
@@ -3234,7 +3042,8 @@ def get_actions():
     if source == "weekly":
         actions = [
             a for a in actions
-            if not _is_pace_year_action(a) and not _is_monthly_pacing_action(a)
+            if a.get("policy") == "pulse-increase-only-v1"
+            and a.get("generated_on") == date.today().isoformat()
         ]
     elif source == "monthly_pacing":
         actions = [a for a in actions if _is_monthly_pacing_action(a)]
