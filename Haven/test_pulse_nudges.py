@@ -160,5 +160,68 @@ class PushTests(unittest.TestCase):
         self.assertEqual(len(self.writes()),1)
 
 
-if __name__ == '__main__':
+
+
+class CalendarLoadTests(unittest.TestCase):
+    def test_live_calendar_without_csv_and_blocks(self):
+        from pulse_nudges import load_pulse_calendars
+        from unittest.mock import Mock
+        p=prop(listing_id='123',pms_name='test',calendar_rates=[])
+        client=Mock()
+        client.request.return_value=[dict(id='123',pms='test',currency='USD',data=[
+            dict(date='2026-10-14',price=100,unbookable=0,booking_status=''),
+            dict(date='2026-10-15',price=100,unbookable=1,booking_status='')])]
+        loaded=load_pulse_calendars([p],client,TODAY)[0]
+        rows=build_nudges(loaded,None,TODAY)['daily_nudges']
+        self.assertEqual([n['date'] for n in rows],['2026-10-14'])
+        self.assertEqual(p.calendar_rates,[])
+        self.assertEqual(rows[0]['minimum_price'],80)
+    def test_missing_calendar_never_uses_stale_csv(self):
+        from pulse_nudges import load_pulse_calendars
+        from unittest.mock import Mock
+        for response in ([],[dict(id='123',pms='other',currency='USD',data=[])],{}):
+            client=Mock();client.request.return_value=response
+            loaded=load_pulse_calendars([prop(listing_id='123',pms_name='test')],client,TODAY)[0]
+            self.assertTrue(loaded.pulse_data_error)
+            self.assertEqual(build_nudges(loaded,None,TODAY)['daily_nudges'],[])
+
+class PulseRouteTests(unittest.TestCase):
+    def setUp(self):
+        import ast, threading
+        from pathlib import Path
+        from types import SimpleNamespace
+        class Flask:
+            def __init__(self, name): pass
+            def route(self, *args, **kwargs): return lambda fn: fn
+        request=SimpleNamespace(get_json=lambda **kw:self.payload)
+        jsonify=lambda **kw:kw
+        from datetime import datetime, timezone
+        from unittest.mock import Mock
+        tree=ast.parse(Path(__file__).with_name('app.py').read_text(encoding='utf-8-sig'))
+        node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='pulse_decision')
+        self.app=Flask(__name__)
+        self.action=dict(id='test',type='pulse_daily_nudge',generated_on=date.today().isoformat(),daily_nudges=[dict(date='a',decision='approved'),dict(date='b',decision='rejected')])
+        self.push=Mock(return_value={})
+        scope=dict(app=self.app,request=request,jsonify=jsonify,date=date,datetime=datetime,timezone=timezone,
+            _actions_lock=threading.Lock(),_load_actions=lambda:[self.action],_save_actions=lambda a:None,
+            _apply_weekly_action=self.push,_finalize_pricelabs_push=lambda a:a,PricingApplyError=ValueError)
+        exec(compile(ast.Module(body=[node],type_ignores=[]),'route','exec'),scope)
+        def post(path, json):
+            self.payload=json
+            result=scope['pulse_decision']('test')
+            return SimpleNamespace(status_code=result[1] if isinstance(result,tuple) else 200)
+        self.client=SimpleNamespace(post=post)
+    def test_only_approved_subset_is_pushed(self):
+        self.assertEqual(self.client.post('/api/pulse/test',json=dict(dates=['b'],decision='push')).status_code,409)
+        self.push.assert_not_called()
+        self.assertEqual(self.client.post('/api/pulse/test',json=dict(dates=['a'],decision='push')).status_code,200)
+        self.assertEqual(len(self.push.call_args.args[0]['daily_nudges']),1)
+        self.assertEqual(self.action['daily_nudges'][1]['decision'],'rejected')
+        self.assertEqual(self.client.post('/api/pulse/test',json=dict(dates=['a'],decision='push')).status_code,409)
+    def test_failed_push_keeps_approval(self):
+        self.push.side_effect=ValueError('stale price')
+        self.assertEqual(self.client.post('/api/pulse/test',json=dict(dates=['a'],decision='push')).status_code,400)
+        self.assertEqual(self.action['daily_nudges'][0]['decision'],'approved')
+
+if __name__ == "__main__":
     unittest.main()
