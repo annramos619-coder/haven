@@ -2,6 +2,7 @@
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 import re
+from copy import copy
 
 POLICY = "pulse-increase-only-v1"
 
@@ -19,6 +20,80 @@ def nudge_band(tags, bedrooms):
     return (1, 3) if fixed else ((1, 5) if int(bedrooms) <= 2 else (5, 10))
 
 
+def calendar_night_open(row):
+    info = (row.get("reason") or {}).get("listing_info") or {}
+    return (str(row.get("unbookable")) == "0"
+            and row.get("booking_status") in ("", "available")
+            and str(info.get("num_bookings", "0")) == "0"
+            and str(info.get("num_blocked", "0")) == "0")
+
+
+def load_pulse_calendars(properties, client, today=None, batch_size=20):
+    """Load dated prices for Pulse without overwriting the portfolio CSV.
+
+    POST /listing_prices is a read operation. Match both ID and PMS, and never
+    substitute stale CSV rates when an API response is missing or fails.
+    """
+    today = today or date.today()
+    loaded = [copy(p) for p in properties]
+    eligible = []
+    for prop in loaded:
+        prop.calendar_rates = []
+        prop.pulse_open_dates = set()
+        prop.pulse_calendar = {}
+        prop.pulse_data_error = ""
+        prop.pulse_last_refreshed = ""
+        if not str(prop.listing_id or "").strip() or not str(prop.pms_name or "").strip():
+            prop.pulse_data_error = "Missing PriceLabs listing ID or PMS. Sync the portfolio first."
+        else:
+            eligible.append(prop)
+    for offset in range(0, len(eligible), batch_size):
+        batch = eligible[offset:offset + batch_size]
+        payload = {"listings": [{"id": str(p.listing_id), "pms": p.pms_name,
+                    "dateFrom": (today + timedelta(days=1)).isoformat(),
+                    "dateTo": (today + timedelta(days=120)).isoformat(), "reason": True} for p in batch]}
+        try:
+            response = client.request("POST", "/listing_prices", payload)
+            if not isinstance(response, list):
+                raise ValueError("PriceLabs returned an unexpected nightly-price response.")
+        except Exception as exc:
+            for prop in batch:
+                prop.pulse_data_error = f"Nightly-price lookup failed: {exc}"
+            continue
+        for prop in batch:
+            matches = [row for row in response if isinstance(row, dict)
+                       and str(row.get("id")) == str(prop.listing_id) and row.get("pms") == prop.pms_name]
+            if len(matches) != 1:
+                prop.pulse_data_error = "PriceLabs did not return one matching listing/PMS calendar."
+                continue
+            listing = matches[0]
+            if listing.get("error") or listing.get("error_status"):
+                prop.pulse_data_error = "PriceLabs: " + str(listing.get("error") or listing.get("error_status"))
+                continue
+            if listing.get("currency") != "USD":
+                prop.pulse_data_error = "USD nightly prices are required for these dollar nudges."
+                continue
+            prop.pulse_last_refreshed = str(listing.get("last_refreshed_at") or "not supplied")
+            for row in listing.get("data") or []:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    day = date.fromisoformat(str(row.get("date")))
+                except ValueError:
+                    continue
+                rate = money(row.get("price"))
+                if rate is None or not today < day <= today + timedelta(days=120):
+                    continue
+                key = day.isoformat()
+                prop.calendar_rates.append((key, float(rate)))
+                prop.pulse_calendar[key] = row
+                if calendar_night_open(row):
+                    prop.pulse_open_dates.add(key)
+            if not prop.calendar_rates:
+                prop.pulse_data_error = "PriceLabs returned no usable nightly prices in the next 120 days."
+    return loaded
+
+
 def build_nudges(prop, reservations, today=None):
     today = today or date.today()
     end = today + timedelta(days=120)
@@ -34,7 +109,9 @@ def build_nudges(prop, reservations, today=None):
         if today < day <= end and rate is not None:
             rates[day] = rate
     booked = set()
-    availability_known = reservations is not None
+    open_dates = getattr(prop, "pulse_open_dates", None)
+    live_calendar = getattr(prop, "pulse_calendar", {})
+    availability_known = open_dates is not None or reservations is not None
     for row in reservations or []:
         if str(row.get("status", "")).lower() in {"cancelled", "canceled", "declined", "rejected"}:
             continue
@@ -55,7 +132,7 @@ def build_nudges(prop, reservations, today=None):
     flat = set()
     run = []
     for day in sorted(rates):
-        if day in booked:
+        if day in booked or (open_dates is not None and day.isoformat() not in open_dates):
             if len(run) >= 4:
                 flat.update(run)
             run = []
@@ -72,12 +149,13 @@ def build_nudges(prop, reservations, today=None):
     nudges = []
     ceiling_holds = 0
     for day, rate in sorted(rates.items()):
-        if day in booked:
+        if day in booked or (open_dates is not None and day.isoformat() not in open_dates):
             continue
         # Never call unverified availability a confirmed gap.
         reasons = []
         if availability_known:
-            reasons.append("Unreserved night: verify owner blocks and availability")
+            reasons.append("PriceLabs calendar shows this night is open" if open_dates is not None else
+                           "Unreserved night: verify owner blocks and availability")
         if day in flat:
             reasons.append("Flat-rate stretch (4+ nights); price history not available")
         if not reasons:
@@ -93,24 +171,32 @@ def build_nudges(prop, reservations, today=None):
         strong = occ >= 0.70
         weekend = day.weekday() in (4, 5)
         delta = high if strong and weekend else ((low + high) // 2 if strong or weekend else low)
-        if maximum is not None:
-            delta = min(delta, int(maximum - rate))
+        daily_info = (live_calendar.get(day.isoformat(), {}).get("reason") or {}).get("listing_info") or {}
+        daily_min = money(daily_info.get("min_price_limit")) or minimum
+        daily_max = money(daily_info.get("max_price_limit")) or maximum
+        if daily_max is not None:
+            delta = min(delta, int(daily_max - rate))
         if delta < low:
             ceiling_holds += 1
             continue
         proposed = rate + Decimal(delta)
-        if minimum is not None and proposed < minimum:
+        if daily_min is not None and proposed < daily_min:
             continue  # Do not jump past the requested nudge cap to fix bad data.
         nudges.append({"date": day.isoformat(), "day": day.strftime("%A"),
-            "current_rate": float(rate), "nudge": delta, "proposed_rate": float(proposed),
+            "minimum_price": float(daily_min) if daily_min else None, "days_out": horizon,
+            "decision": "pending", "current_rate": float(rate), "nudge": delta, "proposed_rate": float(proposed),
             "reason": "; ".join(reasons),
             "demand": f"{'Fri/Sat' if weekend else 'Sun–Thu'}; " +
                 (f"listing occupancy proxy {occ:.0%}" if occ > 0 else "daily demand unavailable; conservative nudge"),
-            "at_minimum": minimum is not None and rate <= minimum})
+            "at_minimum": daily_min is not None and rate <= daily_min})
     return {"daily_nudges": nudges, "fixed_minimum": fixed, "band": f"${low}–${high}",
             "ceiling_holds": ceiling_holds, "has_rates": bool(rates),
             "reservation_data_available": availability_known, "policy": POLICY,
-            "generated_on": today.isoformat()}
+            "generated_on": today.isoformat(),
+            "data_error": getattr(prop, "pulse_data_error", ""),
+            "rates_source": "PriceLabs nightly calendar API" if open_dates is not None else "Portfolio export",
+            "rates_last_refreshed": getattr(prop, "pulse_last_refreshed", ""),
+            "open_nights": len(open_dates) if open_dates is not None else None}
 
 
 class PulsePushError(ValueError):
