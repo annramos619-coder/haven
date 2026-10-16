@@ -1003,7 +1003,7 @@ async function loadActionQueue(generate = false) {
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 class="text-lg font-bold text-slate-900">Weekly Review Queue · Pulse</h2>
-          <p class="text-sm text-slate-500 mt-1">Daily review · Next 120 days · Increases only. Studios–2BR: $1–$5; 3BR+: $5–$10; fixed minimum: $1–$3. Base and minimum prices stay unchanged.</p>
+          <p class="text-sm text-slate-500 mt-1">Daily review · Next 120 days · Increases only. Studios–2BR: $1–$5; 3BR+: $5–$10; min rate / fixed minimum tags: $1–$3. Base and minimum prices stay unchanged.</p>
         </div>
         <button onclick="loadActionQueue(true)" class="text-xs px-3 py-1.5 rounded bg-blue-600 text-white font-semibold">Refresh Pulse Suggestions</button>
       </div>
@@ -1578,7 +1578,8 @@ function actionCard(action) {
   const postApply = pushedToPriceLabs ? (action.apply_result.post_apply || {}) : {};
   const verifiedSync = postApply.verified_sync || {};
   const refresh = postApply.refresh || {};
-  const canPush = action.pricelabs_payload && action.pricelabs_payload.kind && action.pricelabs_payload.kind !== "manual_review";
+  const isPulsePush = action.type === "pulse_daily_nudge" && (action.daily_nudges || []).length > 0;
+  const canPush = isPulsePush || action.pricelabs_payload && action.pricelabs_payload.kind && action.pricelabs_payload.kind !== "manual_review";
   const priceCheck = action.pace_price_check || null;
   const fmtPct = v => Number.isFinite(v) ? `${(v * 100).toFixed(1)}%` : "-";
   const priceCheckHtml = priceCheck ? `
@@ -1645,11 +1646,11 @@ function actionCard(action) {
       </div>
       <div class="flex gap-2 shrink-0">
         ${isApproved ? `
-          ${canPush ? `<button data-action-id="${action.id}" data-action-status="approved" data-action-apply="1" class="action-btn text-xs px-3 py-1.5 rounded bg-indigo-600 text-white font-semibold">Push to PriceLabs</button>` : ""}
+          ${canPush ? `<button data-action-id="${action.id}" data-action-status="approved" data-action-apply="1" class="action-btn text-xs px-3 py-1.5 rounded bg-indigo-600 text-white font-semibold">${action.type === "pulse_daily_nudge" ? "Approve & Push to PriceLabs" : "Push to PriceLabs"}</button>` : ""}
           <button data-action-id="${action.id}" data-action-status="applied" class="action-btn text-xs px-3 py-1.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-semibold">Mark Applied</button>
           <button data-action-id="${action.id}" data-action-status="rejected" class="action-btn text-xs px-3 py-1.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-semibold">Reject</button>
         ` : `
-          <button data-action-id="${action.id}" data-action-status="approved" class="action-btn text-xs px-3 py-1.5 rounded bg-green-600 text-white font-semibold">Approve</button>
+          <button data-action-id="${action.id}" data-action-status="approved" ${isPulsePush ? 'data-action-apply="1"' : ""} class="action-btn text-xs px-3 py-1.5 rounded bg-green-600 text-white font-semibold">${isPulsePush ? "Approve & Push to PriceLabs" : "Approve"}</button>
           <button data-action-id="${action.id}" data-action-status="rejected" class="action-btn text-xs px-3 py-1.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-semibold">Reject</button>
         `}
       </div>
