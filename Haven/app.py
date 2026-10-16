@@ -1221,11 +1221,16 @@ def _suggest_action(prop: Property, reservations=None) -> dict | None:
 
 
 
-def _generate_weekly_actions() -> list[dict]:
+def _generate_weekly_actions(offset=0, limit=None) -> list[dict]:
     existing = _load_actions()
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    protected = [a for a in existing if a.get("policy") != "pulse-increase-only-v1"]
+    candidates = [p for p in _PORTFOLIO if p.active and not p.onboarding]
+    if limit is not None:
+        candidates = candidates[offset:offset + limit]
+    selected = {(str(p.listing_id), p.pms_name) for p in candidates}
+    protected = [a for a in existing if a.get("policy") != "pulse-increase-only-v1" or
+                 (str(a.get("listing_id")), a.get("pms_name")) not in selected]
     reviewed = {}
     for old in existing:
         if old.get("policy") != "pulse-increase-only-v1" or old.get("generated_on") != date.today().isoformat():
@@ -1236,7 +1241,6 @@ def _generate_weekly_actions() -> list[dict]:
                 reviewed[(str(old.get("listing_id")), old.get("pms_name"), row["date"])] = {**row, "decision": state}
     protected_keys = set()
     created_by_key: dict[tuple, dict] = {}
-    candidates = [p for p in _PORTFOLIO if p.active and not p.onboarding]
     from pulse_nudges import load_pulse_calendars
     # Fetch the nightly calendar, not just the portfolio summary, on every refresh.
     try:
@@ -3450,6 +3454,21 @@ def kcity_surge_verify(action_id: str):
         "dates": results,
         "total_overrides_on_listing": len(overrides),
     })
+
+
+@app.route("/api/pulse/scan", methods=["POST"])
+def pulse_scan():
+    payload = request.get_json(silent=True) or {}
+    offset = payload.get("offset", 0)
+    if not isinstance(offset, int) or offset < 0:
+        return jsonify(ok=False, error="Invalid scan offset."), 400
+    total = sum(1 for p in _PORTFOLIO if p.active and not p.onboarding)
+    try:
+        with _actions_lock:
+            _generate_weekly_actions(offset=offset, limit=20)
+    except (PricingApplyError, PriceLabsAPIError) as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, completed=min(offset + 20, total), total=total)
 
 
 @app.route("/api/pulse/<action_id>", methods=["POST"])
