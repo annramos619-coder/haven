@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -988,33 +988,92 @@ function attachDashboardPropertyLinks() {
   });
 }
 
+let pulseActions = [], pulseTab = 'pending', pulseBusy = false;
+const pulseState = (a,n) => n.decision || a.status || 'pending';
+const pulseMoney = v => v == null ? '—' : '$' + Number(v).toFixed(2);
 async function loadActionQueue(generate = false) {
-  const el = document.getElementById("action-queue");
-  if (!el) return;
-  const url = generate ? "/api/actions?source=weekly&generate=1" : "/api/actions?source=weekly";
-  const res = await fetch(url);
-  const data = await res.json();
-  const actions = (data.actions || []).filter(a => ["pending", "approved"].includes(a.status || "pending"));
-  const recoveryActions = actions.filter(a => !(a.type || "").includes("fast_booking"));
-  const fastActions = actions.filter(a => (a.type || "").includes("fast_booking"));
-
-  el.innerHTML = `
-    <section class="kd-card p-5">
-      <div class="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 class="text-lg font-bold text-slate-900">Weekly Review Queue · Pulse</h2>
-          <p class="text-sm text-slate-500 mt-1">Daily review · Next 120 days · Increases only. Studios–2BR: $1–$5; 3BR+: $5–$10; min rate / fixed minimum tags: $1–$3. Base and minimum prices stay unchanged.</p>
-        </div>
-        <button onclick="loadActionQueue(true)" class="text-xs px-3 py-1.5 rounded bg-blue-600 text-white font-semibold">Refresh Pulse Suggestions</button>
-      </div>
-      <div class="mt-4 space-y-2">
-        ${actions.length ? `
-          ${recoveryActions.length ? `<div class="text-xs font-bold uppercase tracking-wide text-slate-400 pt-1">Nightly nudges for review</div>${recoveryActions.map(actionCard).join("")}` : ""}
-          ${fastActions.length ? `<div class="text-xs font-bold uppercase tracking-wide text-slate-400 pt-4">Fast Booking / Possible Underpricing</div>${fastActions.map(actionCard).join("")}` : ""}
-        ` : `<div class="text-sm text-slate-400 py-4">No current Pulse suggestions. Refresh suggestions using the latest dated nightly rates and reservation data.</div>`}
-      </div>
-    </section>`;
-  attachActionButtons();
+  if (pulseBusy) return;
+  pulseBusy = true;
+  const el = document.getElementById('action-queue');
+  el.innerHTML = '<div class="kd-card p-5">'+(generate ? 'Fetching PriceLabs nightly calendars and checking the next 120 days…' : 'Loading Pulse…')+'</div>';
+  try {
+    const res = await fetch('/api/actions?source=weekly'+(generate?'&generate=1':''));
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw Error(data.error || 'Pulse could not load.');
+    pulseActions = data.actions || [];
+    renderPulse();
+  } catch(e) { el.innerHTML = `<div class="kd-card p-5">${escapeHtml(e.message)} <button onclick="loadActionQueue(true)">Retry scan</button></div>`; }
+  finally { pulseBusy = false; }
+}
+function renderPulse() {
+  const all = pulseActions.flatMap(a => (a.daily_nudges||[]).map(n=>({a,n})));
+  const count = s => all.filter(({a,n})=>pulseState(a,n)===s).length;
+  const flat = pulseActions.filter(a=>(a.daily_nudges||[]).some(n=>n.reason.includes('Flat-rate'))).length;
+  document.getElementById('action-queue').innerHTML = `
+  <style>
+  .pulse-panel{background:#fff;border:1px solid #e4e8ef;border-radius:24px;padding:28px;color:#263044}
+  .pulse-panel h2{font-family:Georgia,serif;font-size:27px;font-weight:700;margin:0 0 8px}
+  .pulse-muted{color:#7a879e}.pulse-toolbar,.pulse-tabs{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}
+  .pulse-panel button,.pulse-modal button{padding:10px 16px;border:1px solid #ccd5e3;border-radius:8px;font-weight:600;background:white;cursor:pointer}
+  .pulse-panel button:disabled,.pulse-modal button:disabled{opacity:.5;cursor:wait}
+  .pulse-panel .pulse-active{background:#242b3c;color:white;border-color:#242b3c}
+  .pulse-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}
+  .pulse-stat{padding:20px 10px;text-align:center;background:#f7f9fc;border:1px solid #e1e6ef;border-radius:12px}
+  .pulse-stat strong{display:block;font-size:28px;margin-bottom:4px}.pulse-stat:first-child{background:#eef7ff;color:#376f9c}.pulse-stat:nth-child(2){background:#f0faf3;color:#417c51}
+  .pulse-rules{background:#f7f9fc;border:1px solid #e1e6ef;border-radius:12px;padding:16px;margin:18px 0;font-size:14px}
+  .pulse-listing{border:1px solid #e1e6ef;border-radius:12px;padding:18px;margin-top:14px}
+  .pulse-listing summary{cursor:pointer;font-size:17px;font-weight:700}.pulse-tag{background:#fff4c8;color:#885c20;padding:5px 8px;border-radius:5px;font-size:11px;margin-left:8px}
+  .pulse-scroll{overflow:auto}.pulse-table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:14px}
+  .pulse-table th{text-align:left;color:#8a97ac;padding:12px 10px;border-bottom:1px solid #dce3ee}.pulse-table td{padding:12px 10px;border-bottom:1px solid #edf0f6}.pulse-table .pulse-why{white-space:normal;min-width:240px;max-width:400px}
+  .pulse-up{color:#3c7c60;font-weight:700}.pulse-error{color:#a33a2d;background:#fff4f0;padding:12px;border-radius:8px;margin-top:12px}
+  .pulse-modal{border:0;border-radius:22px;padding:30px;max-width:1100px;width:94vw;max-height:88vh;color:#263044}.pulse-modal::backdrop{background:#0008}.pulse-modal h2{font-size:25px;font-weight:700;margin-bottom:12px}.pulse-modal footer{display:flex;justify-content:flex-end;gap:12px;margin-top:24px}
+  @media(max-width:900px){.pulse-stats{grid-template-columns:repeat(3,1fr)}.pulse-panel{padding:16px}}@media(max-width:500px){.pulse-stats{grid-template-columns:repeat(2,1fr)}}
+  </style>
+  <section class="pulse-panel"><div class="pulse-muted">Pulse · PriceLabs · ${new Set(pulseActions.map(a=>a.listing_id+'|'+a.pms_name)).size} listings in today's scan</div>
+  <h2>Gap &amp; Stagnation Nudges</h2><p class="pulse-muted">Review small nightly increases for open dates in the next 120 days, using your account's PriceLabs prices and availability. Flat-rate stretches are signals to review; historical stagnation is not yet measured.</p>
+  <div class="pulse-toolbar"><button class="pulse-active" onclick="loadActionQueue(true)">↻ Run scan</button><button onclick="exportPulse()">Export CSV</button>${count('approved')?`<button class="pulse-up" onclick="previewPulsePush()">Review &amp; push ${count('approved')} approved rates</button>`:''}</div>
+  <div class="pulse-stats">${[[all.filter(({a,n})=>['pending','approved'].includes(pulseState(a,n))).length,'Nights to nudge'],[all.length,'Increases'],[0,'Decreases'],[count('approved'),'Approved'],[count('rejected'),'Declined'],[flat,'Flat-rate listings']].map(([v,l])=>`<div class="pulse-stat"><strong>${v}</strong>${l}</div>`).join('')}</div>
+  <div class="pulse-tabs" role="tablist">${[['pending','To review'],['approved','Approved'],['applied','Pushed'],['rejected','Declined']].map(([s,l])=>`<button role="tab" aria-selected="${pulseTab===s}" class="${pulseTab===s?'pulse-active':''}" onclick="pulseTab='${s}';renderPulse()">${l} ${count(s)}</button>`).join('')}</div>
+  <div class="pulse-rules"><b>Rules</b> · Studios–2BR <b>+$1–5</b> · 3BR+ <b>+$5–10</b> · Min rate / fixed minimum <b>+$1–3, up only</b> · All open nights within 120 days. Base and minimum prices stay unchanged. Approved pushes create fixed nightly overrides in PriceLabs.</div>
+  ${pulseActions.map((a,i)=>{
+    const rows=(a.daily_nudges||[]).filter(n=>pulseState(a,n)===pulseTab);
+    if(!rows.length && !(pulseTab==='pending' && !(a.daily_nudges||[]).length))return '';
+    return `<details class="pulse-listing" open><summary>${escapeHtml(a.property||a.name||a.listing_id)} <span class="pulse-muted">${escapeHtml(a.group_label||a.group||'')} · ${a.bedrooms==null?'BR unknown':Number(a.bedrooms)+'BR'}</span>${a.fixed_minimum?'<span class="pulse-tag">FIXED MIN</span>':''} <span class="pulse-muted">· ${rows.length} nights</span></summary>
+    <p class="pulse-muted text-xs mt-2">PriceLabs · ${escapeHtml(a.listing_id||'')} · ${escapeHtml(a.pms_name||'')} · Prices refreshed: ${escapeHtml(a.rates_last_refreshed||'Not supplied — run scan')}</p>
+    ${a.data_error?`<p class="pulse-error">${escapeHtml(a.data_error)}</p>`:''}${a.apply_error?`<p class="pulse-error">${escapeHtml(a.apply_error)}</p>`:''}
+    ${rows.length?`${pulseTab!=='applied'?`<div class="pulse-toolbar"><button class="pulse-up" onclick="decidePulse(${i},null,'approved')">Approve all shown</button><button onclick="decidePulse(${i},null,'rejected')">Decline all shown</button></div>`:''}
+    <div class="pulse-scroll"><table class="pulse-table"><thead><tr>${['Date','Day','Out','Posted','Minimum','Nudge','New rate','Decision','Why'].map(h=>'<th>'+h+'</th>').join('')}</tr></thead><tbody>${rows.map(n=>`<tr><td>${escapeHtml(n.date)}</td><td>${escapeHtml(n.day.slice(0,3))}</td><td>${n.days_out??'—'}d</td><td>${pulseMoney(n.current_rate)}</td><td>${pulseMoney(n.minimum_price)}</td><td class="pulse-up">+${pulseMoney(n.nudge)}<br><small>+${(100*n.nudge/n.current_rate).toFixed(1)}%</small></td><td class="pulse-up">${pulseMoney(n.proposed_rate)}</td><td>${pulseTab==='applied'?'Pushed':`<button aria-label="Approve ${escapeHtml(n.date)}" onclick="decidePulse(${i},'${n.date}','approved')">✓</button> <button aria-label="Decline ${escapeHtml(n.date)}" onclick="decidePulse(${i},'${n.date}','rejected')">✕</button>`}</td><td class="pulse-why">${escapeHtml(n.reason)}<br><small class="pulse-muted">${escapeHtml(n.demand||'')}</small></td></tr>`).join('')}</tbody></table></div>`:`<p class="pulse-muted mt-3">${escapeHtml(a.proposed_value||'No eligible open nights. Run scan to load current API prices.')}</p>`}</details>`;
+  }).join('')||'<p class="pulse-muted">No nights in this view. Run a scan to fetch current PriceLabs calendars.</p>'}
+  <p class="pulse-muted text-xs mt-4">Decisions and pushed results shown here are for today's scan. Rescanning preserves pushed nights and unchanged reviewed targets. A push rechecks live prices, availability, tags and limits.</p></section>`;
+}
+async function pulseRequest(a, dates, decision) {
+  const res = await fetch('/api/pulse/'+encodeURIComponent(a.id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dates,decision})});
+  const data=await res.json();if(!res.ok||!data.ok)throw Error(data.error||'Request failed');return data.action;
+}
+async function decidePulse(i,day,decision){
+  if(pulseBusy)return; pulseBusy=true;
+  try{const a=pulseActions[i];const dates=day?[day]:(a.daily_nudges||[]).filter(n=>pulseState(a,n)===pulseTab).map(n=>n.date);pulseActions[i]=await pulseRequest(a,dates,decision);renderPulse();}
+  catch(e){alert(e.message);}finally{pulseBusy=false;}
+}
+function exportPulse(){
+  const cells=v=>'"'+String(v??'').replace(/"/g,'""').replace(/^[=+@-]/,"'$&")+'"';
+  const rows=[['Listing','Listing ID','PMS','Date','Posted','Minimum','Nudge','New rate','Decision','Why']];
+  pulseActions.forEach(a=>(a.daily_nudges||[]).forEach(n=>rows.push([a.property,a.listing_id,a.pms_name,n.date,n.current_rate,n.minimum_price,n.nudge,n.proposed_rate,pulseState(a,n),n.reason])));
+  const url=URL.createObjectURL(new Blob([rows.map(r=>r.map(cells).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download='pricelabs-pulse.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function previewPulsePush(){
+  if(pulseBusy)return;
+  const selected=pulseActions.map(a=>({a,rows:(a.daily_nudges||[]).filter(n=>pulseState(a,n)==='approved')})).filter(x=>x.rows.length);
+  const total=selected.reduce((s,x)=>s+x.rows.length,0);if(!total)return;
+  document.getElementById('pulse-confirm')?.remove();const dialog=document.createElement('dialog');dialog.id='pulse-confirm';dialog.className='pulse-modal';
+  dialog.innerHTML=`<h2>Push ${total} rates to PriceLabs</h2><p class="pulse-muted">Across ${selected.length} listings. These are fixed nightly overrides and affect live pricing when PriceLabs syncs. They replace dynamic nightly prices on these dates until removed. Base and minimum prices stay unchanged.</p><div class="pulse-scroll" style="max-height:50vh;margin-top:20px"><table class="pulse-table"><thead><tr><th>Listing</th><th>Date</th><th>From</th><th>To</th><th>Minimum</th></tr></thead><tbody>${selected.flatMap(({a,rows})=>rows.map(n=>`<tr><td>${escapeHtml(a.property||a.listing_id)}</td><td>${escapeHtml(n.date)} ${escapeHtml(n.day.slice(0,3))}</td><td>${pulseMoney(n.current_rate)}</td><td class="pulse-up">${pulseMoney(n.proposed_rate)}</td><td>${pulseMoney(n.minimum_price)}</td></tr>`)).join('')}</tbody></table></div><p id="pulse-push-status" role="status"></p><footer><button id="pulse-cancel">Cancel</button><button id="pulse-write" style="background:#3d775e;color:white">Yes, write ${total} rates</button></footer>`;
+  document.body.appendChild(dialog);dialog.showModal();dialog.querySelector('#pulse-cancel').onclick=()=>dialog.close();
+  dialog.addEventListener('cancel',e=>{if(pulseBusy)e.preventDefault();});
+  dialog.querySelector('#pulse-write').onclick=async()=>{
+    pulseBusy=true;dialog.querySelectorAll('button').forEach(b=>b.disabled=true);let pushed=0;const errors=[];const notes=[];
+    for(const {a,rows} of selected){try{const updated=await pulseRequest(a,rows.map(n=>n.date),'push');pulseActions=pulseActions.map(x=>x.id===a.id?updated:x);pushed+=rows.length;const post=updated.apply_result?.post_apply; if(post)notes.push(post.refresh?.message||post.verified_sync?.message||'');}catch(e){errors.push((a.property||a.listing_id)+': '+e.message);}}
+    pulseBusy=false;renderPulse();dialog.querySelector('#pulse-push-status').textContent=`${pushed} of ${total} overrides saved. `+errors.join(' ')+' '+notes.filter(Boolean).join(' ');dialog.querySelector('#pulse-cancel').disabled=false;dialog.querySelector('#pulse-cancel').textContent='Close';
+  };
 }
 
 async function loadMonthlyPacing(generate = false) {
@@ -1645,7 +1704,7 @@ function actionCard(action) {
         ${action.apply_error ? `<div class="text-xs font-semibold text-red-700 bg-red-50 border border-red-100 rounded px-2 py-1 mt-2">${escapeHtml(action.apply_error)}</div>` : ""}
       </div>
       <div class="flex gap-2 shrink-0">
-        ${isApproved ? `
+        ${action.type === "pulse_daily_nudge" && !isPulsePush ? `<span class="text-xs text-slate-500">No rate changes to push</span>` : isApproved ? `
           ${canPush ? `<button data-action-id="${action.id}" data-action-status="approved" data-action-apply="1" class="action-btn text-xs px-3 py-1.5 rounded bg-indigo-600 text-white font-semibold">${action.type === "pulse_daily_nudge" ? "Approve & Push to PriceLabs" : "Push to PriceLabs"}</button>` : ""}
           <button data-action-id="${action.id}" data-action-status="applied" class="action-btn text-xs px-3 py-1.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-semibold">Mark Applied</button>
           <button data-action-id="${action.id}" data-action-status="rejected" class="action-btn text-xs px-3 py-1.5 rounded bg-slate-100 text-slate-700 border border-slate-300 font-semibold">Reject</button>
