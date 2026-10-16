@@ -1,4 +1,4 @@
-"""Review-only, increase-only nightly nudges. Never changes provider rates."""
+"""Increase-only nightly suggestions and explicitly approved PriceLabs pushes."""
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 import re
@@ -14,11 +14,16 @@ def money(value):
         return None
 
 
+def nudge_band(tags, bedrooms):
+    fixed = bool(re.search(r"\b(?:fix(?:ed)?[\s_-]*min(?:imum)?|min(?:imum)?[\s_-]+rate)\b", str(tags), re.I))
+    return (1, 3) if fixed else ((1, 5) if int(bedrooms) <= 2 else (5, 10))
+
+
 def build_nudges(prop, reservations, today=None):
     today = today or date.today()
     end = today + timedelta(days=120)
-    fixed = bool(re.search(r"\bfix(?:ed)?[\s_-]*min(?:imum)?\b", str(prop.tags), re.I))
-    low, high = (1, 3) if fixed else ((1, 5) if int(prop.bedrooms or 0) <= 2 else (5, 10))
+    low, high = nudge_band(prop.tags, prop.bedrooms or 0)
+    fixed = (low, high) == (1, 3)
     rates = {}
     for text, value in prop.calendar_rates:
         try:
@@ -106,3 +111,97 @@ def build_nudges(prop, reservations, today=None):
             "ceiling_holds": ceiling_holds, "has_rates": bool(rates),
             "reservation_data_available": availability_known, "policy": POLICY,
             "generated_on": today.isoformat()}
+
+
+class PulsePushError(ValueError):
+    pass
+
+
+def push_nudges(action, client, today=None):
+    """Send approved absolute targets; never recompute/add nudges on retries.
+
+    Customer API docs: /listings/{id}, /listing_prices,
+    /listings/{id}/overrides, and /refresh_listing.
+    """
+    today = today or date.today()
+    if action.get("generated_on") != today.isoformat():
+        raise PulsePushError("Refresh Pulse suggestions today before pushing.")
+    lid, pms = str(action.get("listing_id") or ""), str(action.get("pms_name") or "")
+    rows = action.get("daily_nudges")
+    if not lid or not pms or not isinstance(rows, list) or not 1 <= len(rows) <= 120:
+        raise PulsePushError("Missing listing identity or daily targets. Refresh Pulse suggestions.")
+    response = client.request("GET", f"/listings/{lid}")
+    matches = [x for x in response.get("listings", [])
+               if str(x.get("id")) == lid and x.get("pms") == pms]
+    if len(matches) != 1:
+        raise PulsePushError("Cannot verify the PriceLabs listing and PMS.")
+    listing = matches[0]
+    if listing.get("currency") != "USD" or "tags" not in listing or listing.get("no_of_bedrooms") is None:
+        raise PulsePushError("USD currency, current tags, and bedroom count must be available before pushing.")
+    low, high = nudge_band(listing["tags"], listing["no_of_bedrooms"])
+    prices = client.request("POST", "/listing_prices", {"listings": [{"id": lid, "pms": pms,
+        "dateFrom": (today + timedelta(days=1)).isoformat(),
+        "dateTo": (today + timedelta(days=120)).isoformat(), "reason": True}]})
+    matches = [x for x in prices if isinstance(x, dict) and str(x.get("id")) == lid and x.get("pms") == pms] if isinstance(prices, list) else []
+    if len(matches) != 1 or matches[0].get("error"):
+        raise PulsePushError("Current PriceLabs nightly rates are unavailable.")
+    calendar = {x["date"]: x for x in matches[0].get("data", []) if isinstance(x, dict) and x.get("date")}
+    endpoint = f"/listings/{lid}/overrides"
+    existing_response = client.request("GET", endpoint, params={"pms": pms})
+    if not isinstance(existing_response, dict) or not isinstance(existing_response.get("overrides"), list):
+        raise PulsePushError("Cannot verify existing PriceLabs overrides.")
+    existing = {x["date"]: x for x in existing_response["overrides"] if isinstance(x, dict) and x.get("date")}
+    items, targets = [], {}
+    for row in rows:
+        day = date.fromisoformat(row["date"])
+        key = day.isoformat()
+        old, target = money(row.get("current_rate")), money(row.get("proposed_rate"))
+        if key in targets or not today < day <= today + timedelta(days=120):
+            raise PulsePushError("Duplicate or expired Pulse dates. Refresh suggestions.")
+        if old is None or target is None or not low <= target - old <= high:
+            raise PulsePushError(f"{key}: increase must be ${low}-${high} under the current listing tags.")
+        current = calendar.get(key, {})
+        live = money(current.get("price"))
+        info = (current.get("reason") or {}).get("listing_info") or {}
+        if (str(current.get("unbookable")) != "0" or current.get("booking_status") not in ("", "available")
+                or str(info.get("num_bookings", "0")) != "0" or str(info.get("num_blocked", "0")) != "0"):
+            raise PulsePushError(f"{key}: PriceLabs does not confirm this night is open.")
+        minimum = money(info.get("min_price_limit")) or money(listing.get("min"))
+        maximum = money(info.get("max_price_limit")) or money(listing.get("max"))
+        if live is None or target < live or (minimum and target < minimum) or (maximum and target > maximum):
+            raise PulsePushError(f"{key}: target conflicts with current prices or limits. Refresh suggestions.")
+        targets[key] = target
+        prior = existing.get(key, {})
+        if prior.get("price_type") == "fixed" and money(prior.get("price")) == target:
+            continue  # Exact target already saved: retry cannot compound it.
+        if prior.get("price_type") == "fixed" and money(prior.get("price")) not in (None, old):
+            raise PulsePushError(f"{key}: an existing override changed. Refresh prices in PriceLabs first.")
+        if live != old:
+            raise PulsePushError(f"{key}: nightly price changed. Refresh suggestions before pushing.")
+        # Preserve other date-level restrictions when changing the price field.
+        allowed = ("min_stay", "min_price", "min_price_type", "max_price", "max_price_type",
+                   "base_price", "check_in_check_out_enabled", "check_in", "check_out", "lead_time_expiry")
+        item = {k: prior[k] for k in allowed if k in prior and prior[k] is not None}
+        item.update(date=key, price=float(target), price_type="fixed", currency="USD", reason="Approved Pulse increase")
+        items.append(item)
+    sent = {"pms": pms, "overrides": items, "update_children": False}
+    if items:
+        client.request("POST", endpoint, sent)
+    confirmation = client.request("GET", endpoint, params={"pms": pms})
+    confirmed = {x.get("date"): x for x in confirmation.get("overrides", []) if isinstance(x, dict)}
+    if any(confirmed.get(k, {}).get("price_type") != "fixed" or money(confirmed.get(k, {}).get("price")) != v for k, v in targets.items()):
+        raise PulsePushError("PriceLabs did not confirm every target. Some changes may be saved; verify before retrying.")
+    refresh = {"configured": True, "message": "Overrides saved; price refresh not yet confirmed."}
+    try:
+        refreshed = client.request("POST", "/refresh_listing", {"listing_id": lid, "pms": pms})
+        actual = {x.get("date"): money(x.get("price")) for x in refreshed.get("pricing_array", [])}
+        verified = all(actual.get(k) == v for k, v in targets.items())
+        refresh["message"] = ("PriceLabs refreshed and confirmed all nightly targets." if verified else
+                              "Overrides saved, but refreshed nightly prices differ. Verify in PriceLabs.")
+    except Exception as exc:
+        verified = False
+        refresh["message"] = f"Overrides saved; refresh failed: {exc}. Use Save & Refresh in PriceLabs."
+    return {"provider": "PriceLabs", "listing_id": lid, "pms": pms, "endpoint": endpoint,
+            "sent": sent if items else None, "confirmed_dates": sorted(targets), "idempotent": not items,
+            "pulse_push": True, "post_apply": {"refresh": refresh,
+            "verified_sync": {"verified": verified, "message": refresh["message"]}}}
