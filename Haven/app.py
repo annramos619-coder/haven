@@ -1215,7 +1215,7 @@ def _suggest_action(prop: Property, reservations=None) -> dict | None:
         "implementation": "Review daily against fresh prices and confirmed availability. Apply each absolute target at most once; "
                           "do not add the nudge repeatedly to an old rate. Monitor pickup and occupancy over the next 7 days. "
                           "A rate edit does not guarantee better search placement or bookings.",
-        "pricelabs_payload": {"kind": "manual_review"},
+        "pricelabs_payload": {"kind": "pulse_daily_rates" if nudges else "manual_review"},
     }
 
 
@@ -1927,6 +1927,8 @@ def _verify_pricelabs_push_from_sync(apply_result: dict) -> dict:
 
 
 def _finalize_pricelabs_push(apply_result: dict) -> dict:
+    if apply_result.get("pulse_push"):
+        return apply_result  # Pulse already read back overrides and refreshed prices.
     post_apply = {"verified_sync": None, "refresh": None}
     try:
         post_apply["refresh"] = _run_pricelabs_post_apply_hooks(apply_result)
@@ -2038,6 +2040,12 @@ If a setting says "unknown", do not infer or invent it. Treat PriceLabs as the p
 
 
 def _apply_weekly_action(action: dict) -> dict:
+    if action.get("type") == "pulse_daily_nudge":
+        from pulse_nudges import push_nudges
+        try:
+            return push_nudges(action, client_from_env())
+        except (PriceLabsAPIError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PricingApplyError(str(exc)) from exc
     payload = action.get("pricelabs_payload") or {}
     kind = payload.get("kind")
     if action.get("type") in {
