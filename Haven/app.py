@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 HVR Smokies Dashboard.
 Serves the HTML dashboard and streams Groq AI analysis via Server-Sent Events.
@@ -1200,17 +1200,18 @@ def _suggest_action(prop: Property, reservations=None) -> dict | None:
     result = build_nudges(prop, reservations)
     nudges = result["daily_nudges"]
     return {
-        **_action_context(prop), **result,
+        **_action_context(prop), **result, "bedrooms": prop.bedrooms, "tags": str(prop.tags),
         "type": "pulse_daily_nudge", "priority": "medium",
-        "suggestion": f"Pulse: {len(nudges)} nightly increase suggestions" if nudges else "Pulse: data review needed",
+        "suggestion": f"Pulse: {len(nudges)} nightly increase suggestions" if nudges else ("Pulse: data review needed" if result.get("data_error") else "Pulse: no eligible open nights"),
         "adjustment": f"{result['band']} per night; increases only",
         "target_dates": f"{date.today() + timedelta(days=1)} through {date.today() + timedelta(days=120)}",
         "current_value": "Date-specific nightly rates" if result["has_rates"] else "No dated nightly rates loaded",
-        "proposed_value": "Review each night below; hold base and minimum prices" if nudges else "Hold rates; sync dated rates and verify open nights",
+        "proposed_value": "Review each night below; hold base and minimum prices" if nudges else (result.get("data_error") or "Hold rates; no open nights meet the nudge and price limits"),
         "owner_note": _owner_note(prop),
         "reason": "Friday/Saturday and listing occupancy select the nudge within your band. "
                   "Weekdays also increase under the current policy. No automatic reductions. "
-                  "Unreserved dates are candidates, not confirmed gaps; owner blocks must be checked. "
+                  f"Rates source: {result.get('rates_source', 'portfolio')}. "
+                  f"PriceLabs last refreshed: {result.get('rates_last_refreshed') or 'not supplied'}. "
                   f"{result['ceiling_holds']} nights held at the maximum-price limit.",
         "implementation": "Review daily against fresh prices and confirmed availability. Apply each absolute target at most once; "
                           "do not add the nudge repeatedly to an old rate. Monitor pickup and occupancy over the next 7 days. "
@@ -1224,42 +1225,38 @@ def _generate_weekly_actions() -> list[dict]:
     existing = _load_actions()
     now_dt = datetime.now(timezone.utc)
     now = now_dt.isoformat()
-    protected: list[dict] = []
+    protected = [a for a in existing if a.get("policy") != "pulse-increase-only-v1"]
+    reviewed = {}
+    for old in existing:
+        if old.get("policy") != "pulse-increase-only-v1" or old.get("generated_on") != date.today().isoformat():
+            continue
+        for row in old.get("daily_nudges", []):
+            state = row.get("decision", old.get("status", "pending"))
+            if state in {"approved", "rejected", "applied"}:
+                reviewed[(str(old.get("listing_id")), old.get("pms_name"), row["date"])] = {**row, "decision": state}
     protected_keys = set()
-    for action in existing:
-        if action.get("policy") == "pulse-increase-only-v1" and action.get("status") == "approved":
-            # Regeneration invalidates approvals based on older rate snapshots.
-            continue
-        if _is_pace_year_action(action):
-            continue
-        status = action.get("status", "pending")
-        key = _action_dedupe_key(action)
-        if status in {"approved", "applied"}:
-            protected.append(action)
-            protected_keys.add(key)
-        elif status in {"rejected"} and _recently_reviewed(action, now_dt):
-            protected.append(action)
-            protected_keys.add(key)
-
     created_by_key: dict[tuple, dict] = {}
     candidates = [p for p in _PORTFOLIO if p.active and not p.onboarding]
-    reservations_by_listing = {}
-    reservations_loaded = False
-    if any(p.calendar_rates for p in candidates):
-        try:
-            from pricelabs_reservations import fetch_raw, to_hostaway_shape
-            raw = fetch_raw(stay_start=(date.today() - timedelta(days=365)).isoformat(),
-                            stay_end=(date.today() + timedelta(days=121)).isoformat())
-            for row in raw:
-                reservations_by_listing.setdefault(str(row.get("listing_id") or ""), []).append(to_hostaway_shape(row))
-            reservations_loaded = True
-        except Exception as exc:
-            app.logger.warning("Pulse reservation lookup failed: %s", exc)
+    from pulse_nudges import load_pulse_calendars
+    # Fetch the nightly calendar, not just the portfolio summary, on every refresh.
+    try:
+        pl_client = client_from_env()
+    except PriceLabsAPIError as exc:
+        raise PricingApplyError(str(exc)) from exc
+    candidates = load_pulse_calendars(candidates, pl_client)
     for prop in candidates:
-        reservations = reservations_by_listing.get(str(prop.listing_id), []) if reservations_loaded else None
-        action = _suggest_action(prop, reservations)
+        action = _suggest_action(prop)
         if not action:
             continue
+        for i, row in enumerate(action.get("daily_nudges", [])):
+            previous = reviewed.get((str(action.get("listing_id")), action.get("pms_name"), row["date"]))
+            if previous and (previous["decision"] == "applied" or
+                             (previous["current_rate"], previous["proposed_rate"]) == (row["current_rate"], row["proposed_rate"])):
+                action["daily_nudges"][i] = previous
+        seen = {n["date"] for n in action.get("daily_nudges", [])}
+        for (lid, pms, day), previous in reviewed.items():
+            if lid == str(action.get("listing_id")) and pms == action.get("pms_name") and day not in seen and previous["decision"] == "applied":
+                action["daily_nudges"].append(previous)
         key = _action_dedupe_key(action)
         if key in protected_keys:
             continue
@@ -3045,7 +3042,8 @@ def get_summary():
 def get_actions():
     actions = _load_actions()
     if request.args.get("generate") == "1":
-        actions = _generate_monthly_pacing_actions()[0] if request.args.get("source") == "monthly_pacing" else _generate_weekly_actions()
+        with _actions_lock:
+            actions = _generate_monthly_pacing_actions()[0] if request.args.get("source") == "monthly_pacing" else _generate_weekly_actions()
     source = request.args.get("source")
     if source == "weekly":
         actions = [
@@ -3060,7 +3058,7 @@ def get_actions():
     status = request.args.get("status")
     if status:
         actions = [a for a in actions if a.get("status") == status]
-    else:
+    elif source != "weekly":
         # Always hide rejected/declined unless caller explicitly requests them
         actions = [a for a in actions if a.get("status") not in {"rejected", "declined"}]
     return jsonify({"ok": True, "actions": actions})
@@ -3454,6 +3452,41 @@ def kcity_surge_verify(action_id: str):
     })
 
 
+@app.route("/api/pulse/<action_id>", methods=["POST"])
+def pulse_decision(action_id):
+    """Review dates independently; only server-stored approved targets can be pushed."""
+    payload = request.get_json(silent=True) or {}
+    decision = payload.get("decision")
+    dates = payload.get("dates")
+    if decision not in {"approved", "rejected", "pending", "push"} or not isinstance(dates, list) or not dates or any(not isinstance(d, str) for d in dates) or len(dates) != len(set(dates)):
+        return jsonify(ok=False, error="Choose a decision and unique dates."), 400
+    # Serialize the scan and push so no concurrent scan can discard its result.
+    with _actions_lock:
+        actions = _load_actions()
+        action = next((a for a in actions if a.get("id") == action_id and a.get("type") == "pulse_daily_nudge"), None)
+        if not action or action.get("generated_on") != date.today().isoformat():
+            return jsonify(ok=False, error="This scan has expired. Run a new scan."), 409
+        rows = [r for r in action.get("daily_nudges", []) if r["date"] in dates]
+        if len(rows) != len(dates) or any(r.get("decision", action.get("status", "pending")) == "applied" for r in rows):
+            return jsonify(ok=False, error="Dates are missing or already pushed. Reload Pulse."), 409
+        if decision == "push":
+            if any(r.get("decision") != "approved" for r in rows):
+                return jsonify(ok=False, error="Approve every selected night first."), 409
+            try:
+                result = _finalize_pricelabs_push(_apply_weekly_action({**action, "daily_nudges": rows}))
+            except PricingApplyError as exc:
+                action["apply_error"] = str(exc)
+                _save_actions(actions)
+                return jsonify(ok=False, error=str(exc)), 400
+            action["apply_result"] = result
+            action.pop("apply_error", None)
+        for row in rows:
+            row["decision"] = "applied" if decision == "push" else decision
+        action["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+        _save_actions(actions)
+    return jsonify(ok=True, action=action)
+
+
 @app.route("/api/actions/<action_id>", methods=["POST"])
 def update_action(action_id: str):
     payload = request.get_json(silent=True) or {}
@@ -3473,6 +3506,8 @@ def update_action(action_id: str):
         action = next((a for a in actions if a.get("id") == action_id), None)
         if action is None:
             return jsonify({"ok": False, "error": "Action not found"}), 404
+        if action.get("type") == "pulse_daily_nudge":
+            return jsonify(ok=False, error="Use Pulse's per-night review and push confirmation."), 409
         action["status"] = new_status
         action["reviewed_at"] = datetime.now(timezone.utc).isoformat()
         if new_status == "applied" and not apply_now:
