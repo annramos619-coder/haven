@@ -997,7 +997,19 @@ async function loadActionQueue(generate = false) {
   const el = document.getElementById('action-queue');
   el.innerHTML = '<div class="kd-card p-5">'+(generate ? 'Fetching PriceLabs nightly calendars and checking the next 120 days…' : 'Loading Pulse…')+'</div>';
   try {
-    const res = await fetch('/api/actions?source=weekly'+(generate?'&generate=1':''));
+    if (generate) {
+      let completed = 0, total = 1;
+      while (completed < total) {
+        const scan = await fetch('/api/pulse/scan', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({offset:completed})});
+        if (!scan.ok) {const text=await scan.text(); let message='PriceLabs scan interrupted (HTTP '+scan.status+'). Completed batches are saved; retry the scan.';try{message=JSON.parse(text).error||message;}catch{}throw Error(message);}
+        const progress=await scan.json();
+        if (!progress.ok) throw Error(progress.error || 'Scan failed');
+        completed=progress.completed;total=progress.total;
+        el.innerHTML='<div class="kd-card p-5">Fetching PriceLabs calendars: '+completed+' of '+total+' listings checked…</div>';
+      }
+    }
+    const res = await fetch('/api/actions?source=weekly');
+    if (!res.ok) throw Error('Unable to load Pulse (HTTP '+res.status+'). Retry shortly.');
     const data = await res.json();
     if (!res.ok || !data.ok) throw Error(data.error || 'Pulse could not load.');
     pulseActions = data.actions || [];
